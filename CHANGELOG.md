@@ -1,5 +1,16 @@
 ## Changelog
 
+#### Unreleased
+ - new `lifelines.SurvivalCurveCalibrator`: learns a reusable, monotone recalibration of the entire
+   survival curve of a fitted `CoxPHFitter` or AFT fitter from an independent right-censored cohort.
+   Use via `model.predict_survival_function(df, calibration=calibrator)`.
+ - `survival_probability_calibration` gains a `calibration=` option to diagnose already
+   recalibrated probabilities.
+ - `k_fold_cross_validation` gains calibration-aware evaluation (`calibration_cv`,
+   `calibrator_factory`, `calibration_times`) with `scoring_method="integrated_brier_score"`
+   (negative time-averaged IPCW Brier score of the calibrated probabilities).
+
+
 #### 0.30.0 - 2024-10-29
  - update dependencies (numpy >= 1.14.0)
  - fix for `decimal` kwarg not working in StatisticalResult

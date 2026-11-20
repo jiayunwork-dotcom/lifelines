@@ -1253,6 +1253,89 @@ New in *lifelines* v0.24.11 is the :func:`~lifelines.calibration.survival_probab
     :align: center
 
 
+Learning a recalibrated survival curve
+---------------------------------------------------
+
+The diagnostic above tells you *whether* the predicted probabilities are off.
+:class:`~lifelines.calibration.SurvivalCurveCalibrator` goes one step further: it
+*learns a reusable recalibration of the entire survival curve* from an
+independent, right-censored follow-up cohort, without refitting the base model.
+This is useful when a model was trained on one population (or an older batch of
+equipment) and its risk ranking is still useful, but its absolute probabilities
+are off on the current population.
+
+.. code:: python
+
+        from lifelines import CoxPHFitter, SurvivalCurveCalibrator
+
+        cph = CoxPHFitter().fit(train_df, "T", "E")
+
+        calibrator = SurvivalCurveCalibrator().fit(cph, calibration_df, times=[5, 10, 15, 20, 25])
+
+        # recalibrated curves for new subjects, from the usual prediction entry point
+        calibrated = cph.predict_survival_function(new_df, calibration=calibrator)
+
+        # the diagnostic can evaluate the *calibrated* probabilities
+        survival_probability_calibration(cph, calibration_df, t0=15, calibration=calibrator)
+
+How it works: on the complementary log-log scale of the model's predicted
+cumulative hazard, the calibrator learns a single continuous, piecewise-linear,
+strictly increasing map, shared by all subjects and all times, by maximizing
+the likelihood of the calibration cohort (events contribute grouped-time
+interval masses on the grid, censored subjects contribute their exact survival
+probability -- censoring is never recoded as "no event"). The number of
+segments adapts to the available number of events and a ridge penalty shrinks
+the map towards the identity, so with little event information the model is
+left essentially alone instead of being overfitted. Because the map is
+monotone, calibrated curves stay in [0, 1], are non-increasing in time, never
+reverse the risk order of two subjects at the same time, and give identical
+outputs for identical raw curves.
+
+Scope and limitations: only single-event, right-censored follow-up starting at
+0 with numeric covariates is supported (no weights, entry times, strata,
+competing risks, or ``conditional_after``); CoxPHFitter (default Breslow
+baseline included) and the AFT fitters are supported. The calibration cohort
+must be independent of the model's training data -- that is the caller's
+responsibility. Calibrated predictions are only defined between the smallest
+and largest calibration time; queries outside are rejected rather than
+extrapolated. The calibrator is bound to the exact fitted model instance:
+refitting the model invalidates it. Finally, calibration is learned from a
+finite, censored sample, so there is no guarantee that calibrated probabilities
+are closer to the truth on arbitrary data-generating processes -- evaluate them
+out-of-sample, for example with calibration-aware cross validation.
+
+Calibration-aware cross validation
+---------------------------------------------------
+
+:func:`~lifelines.utils.k_fold_cross_validation` can score the *calibrated*
+probabilities directly. Provide a one-shot iterable of
+``(train, calibrate, test)`` position triples, a factory that returns a fresh
+:class:`~lifelines.calibration.SurvivalCurveCalibrator` per model per fold, and
+the time grid. Each fitter is trained on ``train`` only, its calibrator is
+fitted on ``calibrate`` only, and the fold score is the negative time-averaged
+IPCW integrated Brier score on ``test`` (higher is better), with the censoring
+distribution estimated from the fold's ``calibrate`` rows only.
+
+.. code:: python
+
+        from lifelines import CoxPHFitter, WeibullAFTFitter, SurvivalCurveCalibrator
+        from lifelines.utils import k_fold_cross_validation
+
+        folds = iter([
+            (train_positions_fold1, calibrate_positions_fold1, test_positions_fold1),
+            (train_positions_fold2, calibrate_positions_fold2, test_positions_fold2),
+        ])
+
+        scores = k_fold_cross_validation(
+            [CoxPHFitter(), WeibullAFTFitter()],
+            df, "T", "E",
+            scoring_method="integrated_brier_score",
+            calibration_cv=folds,
+            calibrator_factory=SurvivalCurveCalibrator,
+            calibration_times=[5, 10, 15, 20, 25],
+        )
+
+
 Prediction on censored subjects
 ===================================
 

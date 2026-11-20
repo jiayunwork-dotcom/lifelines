@@ -2397,6 +2397,7 @@ See https://stats.stackexchange.com/q/11109/11867 for more.\n",
         X: Union[Series, DataFrame],
         times: Optional[Union[List[float], ndarray]] = None,
         conditional_after: Optional[List[int]] = None,
+        calibration=None,
     ) -> pd.DataFrame:
         """
         Predict the survival function for individuals, given their covariates. This assumes that the individual
@@ -2418,8 +2419,19 @@ See https://stats.stackexchange.com/q/11109/11867 for more.\n",
             subject has already lived for. Ex: if :math:`T` is the unknown event time, then this represents :math:`s` in
             :math:`T | T > s`. This is useful for knowing the *remaining* hazard/survival of censored subjects.
             The new timeline is the remaining duration of the subject, i.e. normalized back to starting at 0.
+        calibration: lifelines SurvivalCurveCalibrator, optional
+            a fitted :class:`lifelines.calibration.SurvivalCurveCalibrator` bound to this model.
+            When provided, the recalibrated survival curves are returned. ``times`` then defaults to
+            the calibrator's own grid, query times must lie inside the calibration domain, and
+            ``conditional_after`` cannot be combined with ``calibration``.
 
         """
+        if calibration is not None:
+            from lifelines.calibration import SurvivalCurveCalibrator
+
+            if not isinstance(calibration, SurvivalCurveCalibrator):
+                raise ValueError("calibration must be a fitted lifelines SurvivalCurveCalibrator")
+            return calibration._predict_calibrated(self, X, times=times, conditional_after=conditional_after)
         return exp(-self.predict_cumulative_hazard(X, times=times, conditional_after=conditional_after))
 
     def predict_percentile(self, X: DataFrame, p: float = 0.5, conditional_after: Optional[ndarray] = None) -> pd.Series:

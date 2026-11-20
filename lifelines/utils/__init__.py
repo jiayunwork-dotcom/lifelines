@@ -706,7 +706,17 @@ def inv_normal_cdf(p) -> float:
 
 
 def k_fold_cross_validation(
-    fitters, df, duration_col, event_col=None, k=5, scoring_method="log_likelihood", fitter_kwargs={}, seed=None
+    fitters,
+    df,
+    duration_col,
+    event_col=None,
+    k=5,
+    scoring_method="log_likelihood",
+    fitter_kwargs={},
+    seed=None,
+    calibration_cv=None,
+    calibrator_factory=None,
+    calibration_times=None,
 ):  # pylint: disable=dangerous-default-value,too-many-arguments,too-many-locals
     """
     Perform cross validation on a dataset. If multiple models are provided,
@@ -732,12 +742,32 @@ def k_fold_cross_validation(
     k: int
       the number of folds to perform. n/k data will be withheld for testing on.
     scoring_method: str
-        one of {'log_likelihood', 'concordance_index'}
+        one of {'log_likelihood', 'concordance_index', 'integrated_brier_score'}
         log_likelihood: returns the average unpenalized partial log-likelihood.
         concordance_index: returns the concordance-index
+        integrated_brier_score: only available together with ``calibration_cv``,
+        ``calibrator_factory`` and ``calibration_times``; returns the negative
+        time-averaged IPCW Brier score of the *calibrated* probabilities over
+        ``calibration_times`` (higher is better).
     fitter_kwargs:
       keyword args to pass into fitter.fit method.
     seed: fix a seed in np.random.seed
+    calibration_cv: iterable, optional
+        enables calibration-aware cross validation. Must be provided together with
+        ``calibrator_factory`` and ``calibration_times``. The iterable is traversed
+        exactly once; each item must be a ``(train, calibrate, test)`` triple of
+        integer *positions* (not pandas labels) into ``df``. Each group must be
+        non-empty, free of duplicates, and the three groups must be disjoint and
+        within bounds. ``k`` is not used for grouping in this mode and must keep
+        its default value.
+    calibrator_factory: callable, optional
+        called with no arguments, once per model per fold, and must return a new,
+        unfitted :class:`lifelines.calibration.SurvivalCurveCalibrator` each time.
+        The calibrator is fitted on the fold's ``calibrate`` rows only.
+    calibration_times: iterable, optional
+        the (at least three, strictly increasing, finite, positive) time points
+        used both as the calibrator's grid and as the integration grid of the
+        integrated Brier score.
 
     Returns
     -------
@@ -746,6 +776,29 @@ def k_fold_cross_validation(
 
 
     """
+    calibration_args = (calibration_cv, calibrator_factory, calibration_times)
+    if any(arg is not None for arg in calibration_args):
+        if not all(arg is not None for arg in calibration_args):
+            raise ValueError(
+                "calibration_cv, calibrator_factory and calibration_times must all be provided "
+                "together; got only a subset of them."
+            )
+        if k != 5:
+            raise ValueError("k is not used for grouping when calibration_cv is provided; do not pass a non-default k.")
+        if scoring_method != "integrated_brier_score":
+            raise ValueError(
+                "calibration-aware cross validation only supports scoring_method='integrated_brier_score'; "
+                "got %r. The legacy scorers do not evaluate calibrated probabilities." % scoring_method
+            )
+        return _calibration_aware_cross_validation(
+            fitters, df, duration_col, event_col, calibration_cv, calibrator_factory, calibration_times, fitter_kwargs
+        )
+    if scoring_method == "integrated_brier_score":
+        raise ValueError(
+            "scoring_method='integrated_brier_score' requires calibration_cv, calibrator_factory "
+            "and calibration_times."
+        )
+
     # Make sure fitters is a list
     fitters = _to_list(fitters)
 
@@ -784,6 +837,200 @@ def k_fold_cross_validation(
     if len(fitters) == 1:
         return fitter_scores[0]
     return fitter_scores
+
+
+def _validate_fold_positions(positions, n, name):
+    """Validate one group of fold positions: non-empty unique in-bounds integers."""
+    try:
+        arr = np.asarray(list(positions))
+    except TypeError:
+        raise ValueError("%s positions must be an iterable of integers" % name)
+    if arr.ndim != 1 or arr.size == 0:
+        raise ValueError("%s positions must be a non-empty one-dimensional collection" % name)
+    if arr.dtype == bool or not np.issubdtype(arr.dtype, np.integer):
+        if not (np.issubdtype(arr.dtype, np.floating) and np.all(np.isfinite(arr)) and np.all(arr == arr.astype(int))):
+            raise ValueError("%s positions must be integers" % name)
+        arr = arr.astype(int)
+    if np.unique(arr).size != arr.size:
+        raise ValueError("%s positions contain duplicates" % name)
+    if arr.min() < 0 or arr.max() >= n:
+        raise ValueError("%s positions are out of bounds for a dataset of size %d" % (name, n))
+    return arr
+
+
+def _calibration_aware_cross_validation(
+    fitters, df, duration_col, event_col, calibration_cv, calibrator_factory, calibration_times, fitter_kwargs
+):
+    """
+    Cross validation that evaluates recalibrated survival probabilities.
+
+    Each fold provides disjoint train/calibrate/test position groups. Every
+    fitter is fitted once on train; a fresh calibrator from ``calibrator_factory``
+    is fitted on calibrate only; the fold score is the negative time-averaged
+    IPCW Brier score of the calibrated probabilities on test, integrated over
+    ``calibration_times``. The censoring distribution used for the inverse
+    probability weights is estimated from the fold's calibrate rows only.
+    """
+    from lifelines.calibration import SurvivalCurveCalibrator, _validate_calibration_times
+
+    fitters = _to_list(fitters)
+    fitter_scores = [[] for _ in fitters]
+
+    n, _ = df.shape
+    if n == 0:
+        raise ValueError("df is empty")
+    if duration_col not in df.columns:
+        raise ValueError("duration column '%s' is not present in df" % duration_col)
+    if event_col is not None and event_col not in df.columns:
+        raise ValueError("event column '%s' is not present in df" % event_col)
+
+    if event_col is None:
+        event_col = "E"
+        df = df.copy()
+        df[event_col] = 1.0
+
+    durations = df[duration_col].to_numpy(dtype=float, na_value=np.nan)
+    if not np.all(np.isfinite(durations)) or np.any(durations < 0):
+        raise ValueError("durations must be finite and non-negative")
+    events = df[event_col].to_numpy(dtype=float, na_value=np.nan)
+    if not np.all(np.isfinite(events)) or not np.all((events == 0) | (events == 1)):
+        raise ValueError("event column must be coded 0/1")
+
+    times = _validate_calibration_times(calibration_times)
+
+    seen_calibrator_ids = set()
+
+    for fold in calibration_cv:  # the iterable is traversed exactly once
+        try:
+            train_positions, calibrate_positions, test_positions = fold
+        except (TypeError, ValueError):
+            raise ValueError("each item of calibration_cv must be a (train, calibrate, test) triple of positions")
+
+        train_positions = _validate_fold_positions(train_positions, n, "train")
+        calibrate_positions = _validate_fold_positions(calibrate_positions, n, "calibrate")
+        test_positions = _validate_fold_positions(test_positions, n, "test")
+
+        all_positions = np.concatenate([train_positions, calibrate_positions, test_positions])
+        if np.unique(all_positions).size != all_positions.size:
+            raise ValueError("train, calibrate and test positions must be mutually exclusive")
+
+        train_df = df.iloc[train_positions]
+        calibrate_df = df.iloc[calibrate_positions]
+        test_df = df.iloc[test_positions]
+
+        # censoring distribution of this fold, from the calibrate rows only
+        censoring = _CensoringDistribution(
+            calibrate_df[duration_col].to_numpy(dtype=float), calibrate_df[event_col].to_numpy(dtype=float)
+        )
+        if not np.all(censoring(times) > 0):
+            raise RuntimeError(
+                "cannot score this fold: the censoring distribution estimated from the calibrate rows "
+                "does not have positive support over the whole calibration time grid; refusing to "
+                "shorten the time range or score anyway."
+            )
+
+        for fitter, scores in zip(fitters, fitter_scores):
+            fitter.fit(train_df, duration_col=duration_col, event_col=event_col, **fitter_kwargs)
+
+            calibrator = calibrator_factory()
+            if not isinstance(calibrator, SurvivalCurveCalibrator):
+                raise ValueError("calibrator_factory must return a lifelines SurvivalCurveCalibrator")
+            if getattr(calibrator, "_fitted", False) or id(calibrator) in seen_calibrator_ids:
+                raise ValueError(
+                    "calibrator_factory must return a new, unfitted calibrator on every call; "
+                    "got an already fitted or reused one."
+                )
+            seen_calibrator_ids.add(id(calibrator))
+            calibrator.fit(fitter, calibrate_df, times=times)
+
+            scores.append(
+                _integrated_brier_score(fitter, calibrator, test_df, duration_col, event_col, times, censoring)
+            )
+
+    # If a single fitter was given as argument, return a single result
+    if len(fitters) == 1:
+        return fitter_scores[0]
+    return fitter_scores
+
+
+class _CensoringDistribution:
+    """
+    Kaplan-Meier estimate of the censoring survival function G(t) = P(C > t).
+
+    Convention: G is a right-continuous step function that jumps at observed
+    censoring times, so a censoring time equal to an event time is assumed to
+    happen *after* the event (the event at time s is weighted by G(s), which
+    already includes a censoring jump at s).
+    """
+
+    def __init__(self, durations, events):
+        durations = np.asarray(durations, dtype=float)
+        censored = np.asarray(events, dtype=float) == 0
+        censor_times = np.sort(durations[censored])
+        self._times = []
+        self._values = []
+        survival = 1.0
+        for t in np.unique(censor_times):
+            at_risk = np.sum(durations >= t)
+            deaths = np.sum(censor_times == t)
+            survival *= 1.0 - deaths / at_risk
+            self._times.append(t)
+            self._values.append(survival)
+        self._times = np.asarray(self._times)
+        self._values = np.asarray(self._values)
+
+    def __call__(self, t):
+        t = np.asarray(t, dtype=float)
+        if self._times.size == 0:
+            return np.ones_like(t)
+        idx = np.searchsorted(self._times, t, side="right")
+        values = np.concatenate(([1.0], self._values))
+        return values[idx]
+
+
+def _integrated_brier_score(model, calibrator, test_df, duration_col, event_col, times, censoring):
+    """
+    Negative time-averaged Brier score of the calibrated survival probabilities
+    over the grid ``times`` (higher is better).
+
+    Uses the standard inverse-probability-of-censoring weights (Graf et al.,
+    1999): a subject with an observed event at T contributes
+    ``(0 - S_hat(t))^2 / G(T)`` for grid times ``t >= T``; a subject still
+    under follow-up at t contributes ``(1 - S_hat(t))^2 / G(t)``; a subject
+    censored before t contributes nothing at t. Censored rows are neither
+    dropped nor treated as immortal.
+    """
+    T = test_df[duration_col].to_numpy(dtype=float)
+    E = test_df[event_col].to_numpy(dtype=float)
+    n = T.shape[0]
+
+    survival_hat = np.asarray(model.predict_survival_function(test_df, times=times, calibration=calibrator), dtype=float)
+
+    bs = np.zeros(times.size)
+    for j, t in enumerate(times):
+        observed_event = (T <= t) & (E == 1)
+        still_at_risk = T > t
+        loss = 0.0
+        if observed_event.any():
+            weights = censoring(T[observed_event])
+            if not np.all(weights > 0):
+                raise RuntimeError(
+                    "cannot score this fold: no positive censoring support at some observed event times "
+                    "inside the calibration domain; refusing to shorten the time range or score anyway."
+                )
+            loss += np.sum(survival_hat[j, observed_event] ** 2 / weights)
+        if still_at_risk.any():
+            g_t = censoring(np.asarray(t))
+            if not np.all(g_t > 0):
+                raise RuntimeError(
+                    "cannot score this fold: no positive censoring support over the calibration time grid; "
+                    "refusing to shorten the time range or score anyway."
+                )
+            loss += np.sum((1.0 - survival_hat[j, still_at_risk]) ** 2) / g_t
+        bs[j] = loss / n
+
+    trapezoid = getattr(np, "trapezoid", None) or np.trapz
+    return -float(trapezoid(bs, times) / (times[-1] - times[0]))
 
 
 def normalize(X, mean=None, std=None):

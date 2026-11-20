@@ -2305,7 +2305,7 @@ class ParametricRegressionFitter(RegressionFitter):
 
         p.print(style=style)
 
-    def predict_survival_function(self, df, times=None, conditional_after=None) -> pd.DataFrame:
+    def predict_survival_function(self, df, times=None, conditional_after=None, calibration=None) -> pd.DataFrame:
         """
         Predict the survival function for individuals, given their covariates. This assumes that the individual
         just entered the study (that is, we do not condition on how long they have already lived for.)
@@ -2324,6 +2324,11 @@ class ParametricRegressionFitter(RegressionFitter):
             Must be equal is size to df.shape[0] (denoted `n` above).  An iterable (array, list, series) of possibly non-zero values that represent how long the
             subject has already lived for. Ex: if :math:`T` is the unknown event time, then this represents
             :math:`T | T > s`. This is useful for knowing the *remaining* hazard/survival of censored subjects.
+        calibration: lifelines SurvivalCurveCalibrator, optional
+            a fitted :class:`lifelines.calibration.SurvivalCurveCalibrator` bound to this model.
+            When provided, the recalibrated survival curves are returned. ``times`` then defaults to
+            the calibrator's own grid, query times must lie inside the calibration domain, and
+            ``conditional_after`` cannot be combined with ``calibration``.
 
 
         Returns
@@ -2331,6 +2336,12 @@ class ParametricRegressionFitter(RegressionFitter):
         survival_function : DataFrame
             the survival probabilities of individuals over the timeline
         """
+        if calibration is not None:
+            from lifelines.calibration import SurvivalCurveCalibrator
+
+            if not isinstance(calibration, SurvivalCurveCalibrator):
+                raise ValueError("calibration must be a fitted lifelines SurvivalCurveCalibrator")
+            return calibration._predict_calibrated(self, df, times=times, conditional_after=conditional_after)
         return np.exp(-self.predict_cumulative_hazard(df, times=times, conditional_after=conditional_after))
 
     def predict_median(self, df, *, conditional_after=None) -> pd.DataFrame:
@@ -3456,7 +3467,7 @@ class ParametericAFTRegressionFitter(ParametricRegressionFitter):
 
         return primary_scores, ancillary_scores
 
-    def predict_survival_function(self, df, times=None, conditional_after=None, ancillary=None) -> pd.DataFrame:
+    def predict_survival_function(self, df, times=None, conditional_after=None, ancillary=None, calibration=None) -> pd.DataFrame:
         """
         Predict the survival function for individuals, given their covariates. This assumes that the individual
         just entered the study (that is, we do not condition on how long they have already lived for.)
@@ -3478,7 +3489,20 @@ class ParametericAFTRegressionFitter(ParametricRegressionFitter):
             subject has already lived for. Ex: if :math:`T` is the unknown event time, then this represents
             :math:`T | T > s`. This is useful for knowing the *remaining* hazard/survival of censored subjects.
             The new timeline is the remaining duration of the subject, i.e. normalized back to starting at 0.
+        calibration: lifelines SurvivalCurveCalibrator, optional
+            a fitted :class:`lifelines.calibration.SurvivalCurveCalibrator` bound to this model.
+            When provided, the recalibrated survival curves are returned. ``times`` then defaults to
+            the calibrator's own grid, query times must lie inside the calibration domain, and
+            ``conditional_after`` cannot be combined with ``calibration``.
         """
+        if calibration is not None:
+            from lifelines.calibration import SurvivalCurveCalibrator
+
+            if not isinstance(calibration, SurvivalCurveCalibrator):
+                raise ValueError("calibration must be a fitted lifelines SurvivalCurveCalibrator")
+            return calibration._predict_calibrated(
+                self, df, times=times, conditional_after=conditional_after, ancillary=ancillary
+            )
         with np.errstate(divide="ignore"):
             return np.exp(
                 -self.predict_cumulative_hazard(df, ancillary=ancillary, times=times, conditional_after=conditional_after)
